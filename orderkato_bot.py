@@ -182,6 +182,80 @@ def get_user_orders(username: str) -> list[dict]:
     return order_list
 
 
+def update_order_status(order_id: str, new_status: str) -> bool:
+    """
+    Update the status of all rows with the given order_id to new_status.
+    Returns True if successful, False otherwise.
+    """
+    if not ORDERS_DIR.exists():
+        return False
+    
+    updated = False
+    
+    for order_file in ORDERS_DIR.glob("orders_*.csv"):
+        try:
+            # Read all rows
+            rows = []
+            fieldnames = None
+            with open(order_file, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                fieldnames = reader.fieldnames
+                for row in reader:
+                    if row.get("order_id") == order_id:
+                        row["status"] = new_status
+                        updated = True
+                    rows.append(row)
+            
+            # Write back if we made changes
+            if updated and fieldnames:
+                with open(order_file, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(rows)
+                    
+        except Exception as e:
+            logger.error(f"Error updating order in {order_file}: {e}")
+    
+    return updated
+
+
+def delete_order(order_id: str) -> bool:
+    """
+    Delete all rows with the given order_id from CSV files.
+    Returns True if successful, False otherwise.
+    """
+    if not ORDERS_DIR.exists():
+        return False
+    
+    deleted = False
+    
+    for order_file in ORDERS_DIR.glob("orders_*.csv"):
+        try:
+            # Read all rows
+            rows = []
+            fieldnames = None
+            with open(order_file, "r", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                fieldnames = reader.fieldnames
+                for row in reader:
+                    if row.get("order_id") != order_id:
+                        rows.append(row)
+                    else:
+                        deleted = True
+            
+            # Write back if we made changes
+            if deleted and fieldnames:
+                with open(order_file, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=fieldnames)
+                    writer.writeheader()
+                    writer.writerows(rows)
+                    
+        except Exception as e:
+            logger.error(f"Error deleting order from {order_file}: {e}")
+    
+    return deleted
+
+
 def save_order(order_data: dict) -> tuple[str, str]:
     """
     Save order to daily CSV file.
@@ -242,6 +316,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📝 Commands:\n"
         "/order - Start a new order\n"
         "/status - Check your order status\n"
+        "/update - Update order status\n"
         "/cancel - Cancel current order\n"
         "/help - Show help message"
     )
@@ -260,6 +335,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "📝 Commands:\n"
         "/order - Start a new order\n"
         "/status - Check your order status\n"
+        "/update - Update order status\n"
         "/cancel - Cancel current order\n"
         "/help - Show this help message"
     )
@@ -314,6 +390,99 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     message_text += "Type /order to place a new order."
     
     await update.message.reply_text(message_text)
+
+
+async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Show user's orders with options to update status."""
+    user = update.effective_user
+    username = user.username or user.first_name or str(user.id)
+    
+    # Get orders for this user (only pending ones can be updated)
+    all_orders = get_user_orders(username)
+    orders = [o for o in all_orders if o["status"].lower() == "pending"]
+    
+    if not orders:
+        await update.message.reply_text(
+            f"📋 No pending orders found for {username}.\n\n"
+            "Only pending orders can be updated.\n"
+            "Type /status to see all your orders."
+        )
+        return
+    
+    # Build message with buttons for each order
+    message_text = f"📝 UPDATE ORDER STATUS\n"
+    message_text += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    message_text += "Select an order to update:\n\n"
+    
+    keyboard = []
+    for order in orders[:10]:  # Limit to 10 orders
+        # Build items summary
+        items_summary = ", ".join([f"{item['product_name']} x{item['quantity']}" for item in order["items"][:2]])
+        if len(order["items"]) > 2:
+            items_summary += "..."
+        
+        message_text += f"🟡 {order['order_id']} - {order['shop_name']}\n"
+        message_text += f"   {items_summary}\n\n"
+        
+        # Add buttons for this order: Order ID - Delivered - Cancel
+        keyboard.append([
+            InlineKeyboardButton(f"{order['order_id']}", callback_data=f"upd_info:{order['order_id']}"),
+            InlineKeyboardButton("✅ Delivered", callback_data=f"upd_delivered:{order['order_id']}"),
+            InlineKeyboardButton("❌ Cancel", callback_data=f"upd_cancel:{order['order_id']}")
+        ])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        message_text,
+        reply_markup=reply_markup
+    )
+
+
+async def handle_order_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle order status update callbacks."""
+    query = update.callback_query
+    await query.answer()
+    
+    data = query.data
+    
+    if data.startswith("upd_info:"):
+        # Just show a brief toast, do nothing else
+        order_id = data.replace("upd_info:", "")
+        await query.answer(f"Order: {order_id}", show_alert=False)
+        return
+    
+    if data.startswith("upd_delivered:"):
+        order_id = data.replace("upd_delivered:", "")
+        success = update_order_status(order_id, "delivered")
+        
+        if success:
+            await query.edit_message_text(
+                f"✅ Order {order_id} marked as DELIVERED!\n\n"
+                "Type /status to see your orders.\n"
+                "Type /update to update more orders."
+            )
+        else:
+            await query.edit_message_text(
+                f"❌ Failed to update order {order_id}.\n"
+                "Please try again or contact support."
+            )
+    
+    elif data.startswith("upd_cancel:"):
+        order_id = data.replace("upd_cancel:", "")
+        success = delete_order(order_id)
+        
+        if success:
+            await query.edit_message_text(
+                f"🗑️ Order {order_id} has been CANCELLED and deleted!\n\n"
+                "Type /status to see your orders.\n"
+                "Type /order to place a new order."
+            )
+        else:
+            await query.edit_message_text(
+                f"❌ Failed to cancel order {order_id}.\n"
+                "Please try again or contact support."
+            )
 
 
 async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -954,6 +1123,8 @@ def main() -> None:
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("update", update_command))
+    application.add_handler(CallbackQueryHandler(handle_order_update, pattern=r"^upd_"))
     application.add_handler(conv_handler)
     
     # Start the bot
