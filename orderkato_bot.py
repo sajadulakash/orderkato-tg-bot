@@ -3,18 +3,20 @@
 OrderKato Telegram Bot
 A simple order management bot for field operations.
 
-Directory Structure:
-- config/token.txt      : Telegram bot token
-- data/shops.csv        : Shop and area data
-- data/products.csv     : Product SKU data
-- data/orders/          : Daily order files (auto-generated)
+Database: MySQL (Orderkatodb)
+- Host: 127.0.0.1
+- Port: 3306
 """
 
-import csv
-import os
 import logging
-from datetime import datetime
+import os
+import uuid
+from datetime import datetime, timedelta
 from pathlib import Path
+import mysql.connector
+from mysql.connector import Error
+from PIL import Image
+from PIL.ExifTags import TAGS
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -38,13 +40,90 @@ BASE_DIR = Path(__file__).parent.resolve()
 
 # File paths
 TOKEN_FILE = BASE_DIR / "config" / "token.txt"
-ORDER_COUNTER_FILE = BASE_DIR / "config" / "order.txt"
-SHOPS_FILE = BASE_DIR / "data" / "shops.csv"
-PRODUCTS_FILE = BASE_DIR / "data" / "products.csv"
-ORDERS_DIR = BASE_DIR / "data" / "orders"
+
+# MySQL Database Configuration
+DB_CONFIG = {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "database": "Orderkatodb",
+    "user": "sajadulakash",
+    "password": "fringe_core",
+}
 
 # Conversation states
-SELECT_AREA, SELECT_SHOP, SELECT_PRODUCTS, ENTER_QUANTITY, CONFIRM_ORDER = range(5)
+SELECT_AREA, SELECT_SHOP, VERIFY_PHOTO, SELECT_PRODUCTS, ENTER_QUANTITY, CONFIRM_ORDER = range(6)
+
+# Photo verification settings
+SHOP_IMAGE_DIR = BASE_DIR / "ShopImage"
+PHOTO_MAX_AGE_SECONDS = 60  # 1 minute
+
+# Ensure ShopImage directory exists
+SHOP_IMAGE_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def get_photo_datetime(image_path: str) -> datetime | None:
+    """
+    Extract the datetime when the photo was taken from EXIF data.
+    Returns None if no EXIF datetime found.
+    """
+    try:
+        image = Image.open(image_path)
+        exif_data = image._getexif()
+        
+        if not exif_data:
+            return None
+        
+        # Look for DateTimeOriginal (36867) or DateTime (306) tags
+        datetime_tags = {
+            36867: "DateTimeOriginal",  # When photo was taken
+            36868: "DateTimeDigitized",  # When photo was digitized
+            306: "DateTime",  # File modification time
+        }
+        
+        for tag_id in [36867, 36868, 306]:  # Priority order
+            if tag_id in exif_data:
+                datetime_str = exif_data[tag_id]
+                # EXIF datetime format: "YYYY:MM:DD HH:MM:SS"
+                try:
+                    photo_datetime = datetime.strptime(datetime_str, "%Y:%m:%d %H:%M:%S")
+                    return photo_datetime
+                except ValueError:
+                    continue
+        
+        return None
+    except Exception as e:
+        logger.error(f"Error reading EXIF data: {e}")
+        return None
+
+
+def save_shop_photo(file_path: str, shop_id: int, user_id: int) -> str:
+    """
+    Save the verified photo to ShopImage folder.
+    Returns the relative path to the saved image.
+    """
+    # Generate unique filename
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    unique_id = uuid.uuid4().hex[:8]
+    extension = Path(file_path).suffix or ".jpg"
+    filename = f"shop_{shop_id}_user_{user_id}_{timestamp}_{unique_id}{extension}"
+    
+    destination = SHOP_IMAGE_DIR / filename
+    
+    # Copy the file to ShopImage folder
+    import shutil
+    shutil.copy2(file_path, destination)
+    
+    return f"ShopImage/{filename}"
+
+
+def get_db_connection():
+    """Create and return a database connection."""
+    try:
+        connection = mysql.connector.connect(**DB_CONFIG)
+        return connection
+    except Error as e:
+        logger.error(f"Database connection error: {e}")
+        return None
 
 
 def read_token() -> str:
@@ -60,252 +139,282 @@ def read_token() -> str:
 
 
 def read_shops() -> list[dict]:
-    """Read shops data from CSV file."""
+    """Read shops data from database."""
     shops = []
+    connection = get_db_connection()
+    if not connection:
+        return shops
+    
     try:
-        with open(SHOPS_FILE, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                shops.append({
-                    "area_name": row.get("area_name", "").strip(),
-                    "shop_name": row.get("shop_name", "").strip(),
-                    "shop_address": row.get("shop_address", "").strip(),
-                })
-    except FileNotFoundError:
-        logger.error(f"Shops file not found: {SHOPS_FILE}")
+        cursor = connection.cursor(dictionary=True)
+        query = """
+            SELECT s.shop_id, s.shop_name, s.address as shop_address, 
+                   s.owner_name, s.phone_number,
+                   a.area_name, a.area_id
+            FROM shops s
+            JOIN area a ON s.area_id = a.area_id
+            WHERE a.area_type = 'Area'
+            ORDER BY a.area_name, s.shop_name
+        """
+        cursor.execute(query)
+        shops = cursor.fetchall()
+        cursor.close()
+    except Error as e:
+        logger.error(f"Error reading shops: {e}")
+    finally:
+        connection.close()
+    
     return shops
 
 
 def read_products() -> list[dict]:
-    """Read products data from CSV file."""
+    """Read products data from database."""
     products = []
+    connection = get_db_connection()
+    if not connection:
+        return products
+    
     try:
-        with open(PRODUCTS_FILE, "r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                product_name = row.get("product_name", "").strip()
-                if product_name:  # Only add if product_name is not empty
-                    products.append({
-                        "product_name": product_name,
-                    })
-    except FileNotFoundError:
-        logger.error(f"Products file not found: {PRODUCTS_FILE}")
+        cursor = connection.cursor(dictionary=True)
+        query = """
+            SELECT p.product_id, p.product_name, p.price, p.discount,
+                   b.brand_name
+            FROM product p
+            JOIN brand b ON p.brand_id = b.brand_id
+            ORDER BY b.brand_name, p.product_name
+        """
+        cursor.execute(query)
+        products = cursor.fetchall()
+        cursor.close()
+    except Error as e:
+        logger.error(f"Error reading products: {e}")
+    finally:
+        connection.close()
+    
     return products
 
 
-def get_unique_areas() -> list[str]:
-    """Get unique area names from shops data."""
-    shops = read_shops()
-    areas = list(dict.fromkeys(shop["area_name"] for shop in shops if shop["area_name"]))
+def get_unique_areas() -> list[dict]:
+    """Get unique areas from database."""
+    areas = []
+    connection = get_db_connection()
+    if not connection:
+        return areas
+    
+    try:
+        cursor = connection.cursor(dictionary=True)
+        query = """
+            SELECT area_id, area_name 
+            FROM area 
+            WHERE area_type = 'Area'
+            ORDER BY area_name
+        """
+        cursor.execute(query)
+        areas = cursor.fetchall()
+        cursor.close()
+    except Error as e:
+        logger.error(f"Error reading areas: {e}")
+    finally:
+        connection.close()
+    
     return areas
 
 
-def get_shops_by_area(area_name: str) -> list[dict]:
+def get_shops_by_area(area_id: int) -> list[dict]:
     """Get all shops in a specific area."""
-    shops = read_shops()
-    return [shop for shop in shops if shop["area_name"] == area_name]
+    shops = []
+    connection = get_db_connection()
+    if not connection:
+        return shops
+    
+    try:
+        cursor = connection.cursor(dictionary=True)
+        query = """
+            SELECT shop_id, shop_name, address as shop_address, 
+                   owner_name, phone_number
+            FROM shops
+            WHERE area_id = %s
+            ORDER BY shop_name
+        """
+        cursor.execute(query, (area_id,))
+        shops = cursor.fetchall()
+        cursor.close()
+    except Error as e:
+        logger.error(f"Error reading shops by area: {e}")
+    finally:
+        connection.close()
+    
+    return shops
 
 
-def get_next_order_number() -> int:
-    """
-    Get the next order number from counter file, increment and save it.
-    Returns the new order number.
-    """
-    # Ensure config directory exists
-    ORDER_COUNTER_FILE.parent.mkdir(parents=True, exist_ok=True)
+def get_user_by_telegram(tel_username: str) -> dict | None:
+    """Get user from database by telegram username."""
+    connection = get_db_connection()
+    if not connection:
+        return None
     
-    # Read current number
-    current_num = 0
-    if ORDER_COUNTER_FILE.exists():
-        try:
-            with open(ORDER_COUNTER_FILE, "r", encoding="utf-8") as f:
-                content = f.read().strip()
-                if content.isdigit():
-                    current_num = int(content)
-        except Exception:
-            current_num = 0
+    user = None
+    try:
+        cursor = connection.cursor(dictionary=True)
+        query = "SELECT * FROM users WHERE tel_username = %s"
+        cursor.execute(query, (tel_username,))
+        user = cursor.fetchone()
+        cursor.close()
+    except Error as e:
+        logger.error(f"Error reading user: {e}")
+    finally:
+        connection.close()
     
-    # Increment
-    next_num = current_num + 1
-    
-    # Save new number
-    with open(ORDER_COUNTER_FILE, "w", encoding="utf-8") as f:
-        f.write(str(next_num))
-    
-    return next_num
+    return user
 
 
-def get_user_orders(username: str) -> list[dict]:
-    """
-    Get all orders for a specific user from all order files.
-    Returns a list of unique orders with their status.
-    """
-    orders = {}
+def get_user_orders(user_id: int) -> list[dict]:
+    """Get all orders for a specific user from database."""
+    orders = []
+    connection = get_db_connection()
+    if not connection:
+        return orders
     
-    # Check if orders directory exists
-    if not ORDERS_DIR.exists():
-        return []
+    try:
+        cursor = connection.cursor(dictionary=True)
+        query = """
+            SELECT o.order_id, o.order_timestamp, o.order_status,
+                   s.shop_name, a.area_name
+            FROM orders o
+            LEFT JOIN shops s ON o.shop_id = s.shop_id
+            LEFT JOIN area a ON s.area_id = a.area_id
+            WHERE o.user_id = %s
+            ORDER BY o.order_timestamp DESC
+            LIMIT 20
+        """
+        cursor.execute(query, (user_id,))
+        order_rows = cursor.fetchall()
+        
+        for order_row in order_rows:
+            # Get items for this order
+            items_query = """
+                SELECT p.product_name, op.quantity
+                FROM order_product op
+                JOIN product p ON op.product_id = p.product_id
+                WHERE op.order_id = %s
+            """
+            cursor.execute(items_query, (order_row['order_id'],))
+            items = cursor.fetchall()
+            
+            orders.append({
+                "order_id": f"ord{order_row['order_id']}",
+                "order_date": order_row['order_timestamp'].strftime("%Y-%m-%d"),
+                "order_time": order_row['order_timestamp'].strftime("%H:%M:%S"),
+                "area_name": order_row['area_name'] or "N/A",
+                "shop_name": order_row['shop_name'] or "N/A",
+                "status": order_row['order_status'],
+                "items": items
+            })
+        
+        cursor.close()
+    except Error as e:
+        logger.error(f"Error reading user orders: {e}")
+    finally:
+        connection.close()
     
-    # Read all order files
-    for order_file in ORDERS_DIR.glob("orders_*.csv"):
-        try:
-            with open(order_file, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    # Check if this order belongs to the user
-                    if row.get("username", "").lower() == username.lower():
-                        order_id = row.get("order_id", "")
-                        if order_id:
-                            # Group by order_id, keep the status
-                            if order_id not in orders:
-                                orders[order_id] = {
-                                    "order_id": order_id,
-                                    "order_date": row.get("order_date", ""),
-                                    "order_time": row.get("order_time", ""),
-                                    "area_name": row.get("area_name", ""),
-                                    "shop_name": row.get("shop_name", ""),
-                                    "status": row.get("status", "pending"),
-                                    "items": []
-                                }
-                            # Add item to the order
-                            orders[order_id]["items"].append({
-                                "product_name": row.get("product_name", ""),
-                                "quantity": row.get("quantity", "0")
-                            })
-        except Exception as e:
-            logger.error(f"Error reading order file {order_file}: {e}")
-    
-    # Convert to list and sort by date/time (newest first)
-    order_list = list(orders.values())
-    order_list.sort(key=lambda x: (x["order_date"], x["order_time"]), reverse=True)
-    
-    return order_list
+    return orders
 
 
 def update_order_status(order_id: str, new_status: str) -> bool:
-    """
-    Update the status of all rows with the given order_id to new_status.
-    Returns True if successful, False otherwise.
-    """
-    if not ORDERS_DIR.exists():
+    """Update the status of an order in database."""
+    connection = get_db_connection()
+    if not connection:
         return False
     
-    updated = False
-    
-    for order_file in ORDERS_DIR.glob("orders_*.csv"):
-        try:
-            # Read all rows
-            rows = []
-            fieldnames = None
-            with open(order_file, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                fieldnames = reader.fieldnames
-                for row in reader:
-                    if row.get("order_id") == order_id:
-                        row["status"] = new_status
-                        updated = True
-                    rows.append(row)
-            
-            # Write back if we made changes
-            if updated and fieldnames:
-                with open(order_file, "w", newline="", encoding="utf-8") as f:
-                    writer = csv.DictWriter(f, fieldnames=fieldnames)
-                    writer.writeheader()
-                    writer.writerows(rows)
-                    
-        except Exception as e:
-            logger.error(f"Error updating order in {order_file}: {e}")
-    
-    return updated
+    try:
+        # Extract numeric ID from "ord123" format
+        numeric_id = int(order_id.replace("ord", ""))
+        
+        cursor = connection.cursor()
+        query = "UPDATE orders SET order_status = %s WHERE order_id = %s"
+        cursor.execute(query, (new_status, numeric_id))
+        connection.commit()
+        updated = cursor.rowcount > 0
+        cursor.close()
+        return updated
+    except Error as e:
+        logger.error(f"Error updating order status: {e}")
+        return False
+    finally:
+        connection.close()
 
 
 def delete_order(order_id: str) -> bool:
-    """
-    Delete all rows with the given order_id from CSV files.
-    Returns True if successful, False otherwise.
-    """
-    if not ORDERS_DIR.exists():
+    """Delete an order from database."""
+    connection = get_db_connection()
+    if not connection:
         return False
     
-    deleted = False
-    
-    for order_file in ORDERS_DIR.glob("orders_*.csv"):
-        try:
-            # Read all rows
-            rows = []
-            fieldnames = None
-            with open(order_file, "r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                fieldnames = reader.fieldnames
-                for row in reader:
-                    if row.get("order_id") != order_id:
-                        rows.append(row)
-                    else:
-                        deleted = True
-            
-            # Write back if we made changes
-            if deleted and fieldnames:
-                with open(order_file, "w", newline="", encoding="utf-8") as f:
-                    writer = csv.DictWriter(f, fieldnames=fieldnames)
-                    writer.writeheader()
-                    writer.writerows(rows)
-                    
-        except Exception as e:
-            logger.error(f"Error deleting order from {order_file}: {e}")
-    
-    return deleted
+    try:
+        # Extract numeric ID from "ord123" format
+        numeric_id = int(order_id.replace("ord", ""))
+        
+        cursor = connection.cursor()
+        # Delete order items first
+        cursor.execute("DELETE FROM order_product WHERE order_id = %s", (numeric_id,))
+        # Delete order
+        cursor.execute("DELETE FROM orders WHERE order_id = %s", (numeric_id,))
+        connection.commit()
+        deleted = cursor.rowcount > 0
+        cursor.close()
+        return deleted
+    except Error as e:
+        logger.error(f"Error deleting order: {e}")
+        return False
+    finally:
+        connection.close()
 
 
 def save_order(order_data: dict) -> tuple[str, str]:
     """
-    Save order to daily CSV file.
-    Creates a new file if it doesn't exist for the current date.
-    Returns tuple of (filename, order_id).
+    Save order to database.
+    Returns tuple of (status_message, order_id).
     """
-    # Ensure orders directory exists
-    ORDERS_DIR.mkdir(parents=True, exist_ok=True)
+    connection = get_db_connection()
+    if not connection:
+        raise Exception("Database connection failed")
     
-    # Generate filename with current date
-    today = datetime.now().strftime("%Y-%m-%d")
-    filename = f"orders_{today}.csv"
-    filepath = ORDERS_DIR / filename
-    
-    # Check if file exists to determine if we need to write header
-    file_exists = filepath.exists()
-    
-    # Get next order number and generate short order ID
-    order_num = get_next_order_number()
-    order_id = f"ord{order_num}"
-    now = datetime.now()
-    
-    # Write order data
-    with open(filepath, "a", newline="", encoding="utf-8") as f:
-        fieldnames = ["order_id", "order_date", "order_time", "username", "area_name", "shop_name", "product_name", "quantity", "status"]
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+    try:
+        cursor = connection.cursor()
         
-        if not file_exists:
-            writer.writeheader()
+        # Insert order with image_url
+        image_url = order_data.get("image_url")
+        order_query = """
+            INSERT INTO orders (user_id, shop_id, order_timestamp, image_url, order_status)
+            VALUES (%s, %s, %s, %s, 'Pending')
+        """
+        cursor.execute(order_query, (
+            order_data["user_id"],
+            order_data["shop_id"],
+            datetime.now(),
+            image_url
+        ))
         
-        # Current timestamp
-        order_date = now.strftime("%Y-%m-%d")
-        order_time = now.strftime("%H:%M:%S")
+        order_id = cursor.lastrowid
         
-        # Write each product as a separate row (same order_id for all items in this order)
-        for product_name, qty in order_data["items"].items():
+        # Insert order items
+        items_query = """
+            INSERT INTO order_product (order_id, product_id, quantity)
+            VALUES (%s, %s, %s)
+        """
+        for product_id, qty in order_data["items"].items():
             if qty > 0:
-                writer.writerow({
-                    "order_id": order_id,
-                    "order_date": order_date,
-                    "order_time": order_time,
-                    "username": order_data.get("username", ""),
-                    "area_name": order_data["area_name"],
-                    "shop_name": order_data["shop_name"],
-                    "product_name": product_name,
-                    "quantity": qty,
-                    "status": "pending",
-                })
-    
-    return filename, order_id
+                cursor.execute(items_query, (order_id, product_id, qty))
+        
+        connection.commit()
+        cursor.close()
+        
+        return "success", f"ord{order_id}"
+    except Error as e:
+        logger.error(f"Error saving order: {e}")
+        raise Exception(f"Error saving order: {e}")
+    finally:
+        connection.close()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -345,20 +454,30 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show order status for the user."""
     user = update.effective_user
-    username = user.username or user.first_name or str(user.id)
+    tel_username = user.username or ""
+    
+    # Get user from database
+    db_user = get_user_by_telegram(tel_username)
+    
+    if not db_user:
+        await update.message.reply_text(
+            f"❌ User @{tel_username} not registered.\n\n"
+            "Please contact admin to register."
+        )
+        return
     
     # Get orders for this user
-    orders = get_user_orders(username)
+    orders = get_user_orders(db_user['user_id'])
     
     if not orders:
         await update.message.reply_text(
-            f"📋 No orders found for {username}.\n\n"
+            f"📋 No orders found for {db_user['name']}.\n\n"
             "Type /order to place a new order."
         )
         return
     
     # Build status message
-    message_text = f"📋 ORDER STATUS FOR {username.upper()}\n"
+    message_text = f"📋 ORDER STATUS FOR {db_user['name'].upper()}\n"
     message_text += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
     
     for order in orders[:10]:  # Show last 10 orders
@@ -367,8 +486,8 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             status_icon = "🟡"
         elif status == "DELIVERED":
             status_icon = "✅"
-        elif status == "CANCELLED":
-            status_icon = "❌"
+        elif status in ["UNDER-DELIVERED", "OVER-DELIVERED"]:
+            status_icon = "⚠️"
         else:
             status_icon = "⚪"
         
@@ -395,15 +514,25 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Show user's orders with options to update status."""
     user = update.effective_user
-    username = user.username or user.first_name or str(user.id)
+    tel_username = user.username or ""
+    
+    # Get user from database
+    db_user = get_user_by_telegram(tel_username)
+    
+    if not db_user:
+        await update.message.reply_text(
+            f"❌ User @{tel_username} not registered.\n\n"
+            "Please contact admin to register."
+        )
+        return
     
     # Get orders for this user (only pending ones can be updated)
-    all_orders = get_user_orders(username)
-    orders = [o for o in all_orders if o["status"].lower() == "pending"]
+    all_orders = get_user_orders(db_user['user_id'])
+    orders = [o for o in all_orders if o["status"].upper() == "PENDING"]
     
     if not orders:
         await update.message.reply_text(
-            f"📋 No pending orders found for {username}.\n\n"
+            f"📋 No pending orders found for {db_user['name']}.\n\n"
             "Only pending orders can be updated.\n"
             "Type /status to see all your orders."
         )
@@ -424,7 +553,7 @@ async def update_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         message_text += f"🟡 {order['order_id']} - {order['shop_name']}\n"
         message_text += f"   {items_summary}\n\n"
         
-        # Add buttons for this order: Order ID - Delivered - Cancel
+        # Add buttons for this order
         keyboard.append([
             InlineKeyboardButton(f"{order['order_id']}", callback_data=f"upd_info:{order['order_id']}"),
             InlineKeyboardButton("✅ Delivered", callback_data=f"upd_delivered:{order['order_id']}"),
@@ -447,14 +576,13 @@ async def handle_order_update(update: Update, context: ContextTypes.DEFAULT_TYPE
     data = query.data
     
     if data.startswith("upd_info:"):
-        # Just show a brief toast, do nothing else
         order_id = data.replace("upd_info:", "")
         await query.answer(f"Order: {order_id}", show_alert=False)
         return
     
     if data.startswith("upd_delivered:"):
         order_id = data.replace("upd_delivered:", "")
-        success = update_order_status(order_id, "delivered")
+        success = update_order_status(order_id, "Delivered")
         
         if success:
             await query.edit_message_text(
@@ -487,21 +615,37 @@ async def handle_order_update(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def order_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Start the order process - show area selection."""
-    # Clear any previous order data
+    user = update.effective_user
+    tel_username = user.username or ""
+    
+    # Check if user is registered
+    db_user = get_user_by_telegram(tel_username)
+    if not db_user:
+        await update.message.reply_text(
+            f"❌ User @{tel_username} not registered.\n\n"
+            "Please contact admin to register."
+        )
+        return ConversationHandler.END
+    
+    # Clear any previous order data and store user info
     context.user_data.clear()
+    context.user_data["db_user"] = db_user
     
     areas = get_unique_areas()
     
     if not areas:
         await update.message.reply_text(
-            "❌ No areas found. Please check the shops.csv file."
+            "❌ No areas found. Please contact admin."
         )
         return ConversationHandler.END
     
     # Create inline keyboard with areas
     keyboard = []
     for area in areas:
-        keyboard.append([InlineKeyboardButton(area, callback_data=f"area:{area}")])
+        keyboard.append([InlineKeyboardButton(
+            area['area_name'], 
+            callback_data=f"area:{area['area_id']}:{area['area_name']}"
+        )])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -519,12 +663,16 @@ async def area_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     query = update.callback_query
     await query.answer()
     
-    # Extract area name from callback data
-    area_name = query.data.replace("area:", "")
+    # Extract area info from callback data
+    parts = query.data.replace("area:", "").split(":", 1)
+    area_id = int(parts[0])
+    area_name = parts[1]
+    
+    context.user_data["area_id"] = area_id
     context.user_data["area_name"] = area_name
     
     # Get shops in this area
-    shops = get_shops_by_area(area_name)
+    shops = get_shops_by_area(area_id)
     
     if not shops:
         await query.edit_message_text(
@@ -537,9 +685,9 @@ async def area_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     for shop in shops:
         display_text = shop["shop_name"]
         if shop["shop_address"]:
-            display_text += f" ({shop['shop_address']})"
+            display_text += f" ({shop['shop_address'][:30]}...)" if len(shop['shop_address']) > 30 else f" ({shop['shop_address']})"
         keyboard.append([
-            InlineKeyboardButton(display_text, callback_data=f"shop:{shop['shop_name']}")
+            InlineKeyboardButton(display_text, callback_data=f"shop:{shop['shop_id']}:{shop['shop_name']}")
         ])
     
     # Add back button
@@ -565,7 +713,10 @@ async def back_to_areas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     
     keyboard = []
     for area in areas:
-        keyboard.append([InlineKeyboardButton(area, callback_data=f"area:{area}")])
+        keyboard.append([InlineKeyboardButton(
+            area['area_name'], 
+            callback_data=f"area:{area['area_id']}:{area['area_name']}"
+        )])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -579,18 +730,146 @@ async def back_to_areas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 
 async def shop_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle shop selection - show product selection."""
+    """Handle shop selection - request photo verification."""
     query = update.callback_query
     await query.answer()
     
-    # Extract shop name from callback data
-    shop_name = query.data.replace("shop:", "")
-    context.user_data["shop_name"] = shop_name
-    context.user_data["items"] = {}  # Initialize items dictionary
-    context.user_data["current_product"] = None
+    # Extract shop info from callback data
+    parts = query.data.replace("shop:", "").split(":", 1)
+    shop_id = int(parts[0])
+    shop_name = parts[1]
     
-    # Show product selection
-    return await show_product_selection(query, context)
+    context.user_data["shop_id"] = shop_id
+    context.user_data["shop_name"] = shop_name
+    context.user_data["items"] = {}  # product_id -> quantity
+    context.user_data["current_product"] = None
+    context.user_data["verified_photo_path"] = None
+    
+    # Request photo verification
+    area_name = context.user_data.get("area_name", "")
+    
+    keyboard = [[InlineKeyboardButton("◀️ Back to Shops", callback_data="back:shops")]]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await query.edit_message_text(
+        f"📍 Area: **{area_name}**\n"
+        f"🏪 Shop: **{shop_name}**\n\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        "📸 **PHOTO VERIFICATION REQUIRED**\n"
+        "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "Please send a photo of the shop **as a document/file**.\n\n"
+        "⚠️ **Requirements:**\n"
+        "• Send photo as **File/Document** (not as compressed photo)\n"
+        "• Photo must be taken **within the last 1 minute**\n"
+        "• Photo must contain EXIF metadata\n\n"
+        "📎 To send as file: Attach → File → Select photo",
+        reply_markup=reply_markup,
+        parse_mode="Markdown"
+    )
+    
+    return VERIFY_PHOTO
+
+
+async def handle_photo_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle photo document for verification."""
+    document = update.message.document
+    
+    # Check if it's an image file
+    mime_type = document.mime_type or ""
+    if not mime_type.startswith("image/"):
+        await update.message.reply_text(
+            "❌ **Invalid format!**\n\n"
+            "Please send an **image file** (JPEG, PNG, etc.) as a document.\n\n"
+            "📎 Tap Attach → File → Select your photo",
+            parse_mode="Markdown"
+        )
+        return VERIFY_PHOTO
+    
+    # Download the file
+    file = await document.get_file()
+    
+    # Create temp file path
+    temp_dir = BASE_DIR / "temp"
+    temp_dir.mkdir(exist_ok=True)
+    
+    extension = Path(document.file_name).suffix if document.file_name else ".jpg"
+    temp_path = temp_dir / f"temp_{update.effective_user.id}_{datetime.now().strftime('%Y%m%d%H%M%S')}{extension}"
+    
+    await file.download_to_drive(temp_path)
+    
+    # Extract photo datetime from EXIF
+    photo_datetime = get_photo_datetime(str(temp_path))
+    
+    if not photo_datetime:
+        # Clean up temp file
+        temp_path.unlink(missing_ok=True)
+        
+        await update.message.reply_text(
+            "❌ **No EXIF data found!**\n\n"
+            "This photo doesn't contain timestamp information.\n\n"
+            "Please take a **new photo** with your camera app and send it as a document.\n\n"
+            "💡 Make sure your camera saves EXIF data (location/time info).",
+            parse_mode="Markdown"
+        )
+        return VERIFY_PHOTO
+    
+    # Check if photo was taken within the allowed time
+    current_time = datetime.now()
+    time_diff = (current_time - photo_datetime).total_seconds()
+    
+    if time_diff > PHOTO_MAX_AGE_SECONDS:
+        # Clean up temp file
+        temp_path.unlink(missing_ok=True)
+        
+        # Calculate how old the photo is
+        minutes_old = int(time_diff / 60)
+        seconds_old = int(time_diff % 60)
+        
+        await update.message.reply_text(
+            "❌ **Photo is too old!**\n\n"
+            f"📅 Photo taken: {photo_datetime.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"⏱️ Age: {minutes_old}m {seconds_old}s ago\n"
+            f"⏳ Maximum allowed: {PHOTO_MAX_AGE_SECONDS} seconds\n\n"
+            "Please take a **fresh photo** right now and send it as a document.",
+            parse_mode="Markdown"
+        )
+        return VERIFY_PHOTO
+    
+    # Photo verified! Save it
+    shop_id = context.user_data.get("shop_id")
+    db_user = context.user_data.get("db_user")
+    
+    image_url = save_shop_photo(str(temp_path), shop_id, db_user['user_id'])
+    context.user_data["verified_photo_path"] = image_url
+    
+    # Clean up temp file
+    temp_path.unlink(missing_ok=True)
+    
+    await update.message.reply_text(
+        "✅ **Photo Verified Successfully!**\n\n"
+        f"📅 Photo taken: {photo_datetime.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        f"⏱️ Time difference: {int(time_diff)} seconds\n\n"
+        "Proceeding to product selection...",
+        parse_mode="Markdown"
+    )
+    
+    # Show product selection as a new message
+    return await show_product_selection_new_message(update, context)
+
+
+async def handle_compressed_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle when user sends a compressed photo instead of document."""
+    await update.message.reply_text(
+        "❌ **Invalid format!**\n\n"
+        "You sent a **compressed photo**. Please send it as a **document/file** instead.\n\n"
+        "📎 How to send as file:\n"
+        "1. Tap the 📎 attach icon\n"
+        "2. Select **File** (not Photo)\n"
+        "3. Choose your photo from gallery\n\n"
+        "This preserves the EXIF data needed for verification.",
+        parse_mode="Markdown"
+    )
+    return VERIFY_PHOTO
 
 
 async def show_product_selection(query, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -599,7 +878,7 @@ async def show_product_selection(query, context: ContextTypes.DEFAULT_TYPE) -> i
     
     if not products:
         await query.edit_message_text(
-            "❌ No products found. Please check the products.csv file."
+            "❌ No products found. Please contact admin."
         )
         return ConversationHandler.END
     
@@ -611,23 +890,25 @@ async def show_product_selection(query, context: ContextTypes.DEFAULT_TYPE) -> i
     order_summary = ""
     if items:
         order_summary = "\n\n📦 **Current Order:**\n"
-        for product_name, qty in items.items():
-            if qty > 0:
-                order_summary += f"• {product_name}: {qty}\n"
+        for product in products:
+            pid = product['product_id']
+            if pid in items and items[pid] > 0:
+                order_summary += f"• {product['product_name']}: {items[pid]}\n"
     
     # Create inline keyboard with products
     keyboard = []
     for product in products:
-        name = product["product_name"]
-        qty = items.get(name, 0)
+        pid = product['product_id']
+        qty = items.get(pid, 0)
+        price = float(product['price'])
         
         if qty > 0:
-            display_text = f"✅ {name} ({qty})"
+            display_text = f"✅ {product['product_name']} (৳{price:.0f}) [{qty}]"
         else:
-            display_text = f"➕ {name}"
+            display_text = f"➕ {product['product_name']} (৳{price:.0f})"
         
         keyboard.append([
-            InlineKeyboardButton(display_text, callback_data=f"product:{name}")
+            InlineKeyboardButton(display_text, callback_data=f"product:{pid}:{product['product_name']}")
         ])
     
     # Add action buttons
@@ -639,7 +920,7 @@ async def show_product_selection(query, context: ContextTypes.DEFAULT_TYPE) -> i
     if action_row:
         keyboard.append(action_row)
     
-    keyboard.append([InlineKeyboardButton("◀️ Back to Shops", callback_data=f"back:shops")])
+    keyboard.append([InlineKeyboardButton("◀️ Back to Shops", callback_data="back:shops")])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -665,18 +946,15 @@ async def product_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     query = update.callback_query
     await query.answer()
     
-    # Extract product name from callback data
-    product_name = query.data.replace("product:", "")
-    context.user_data["current_product"] = product_name
+    # Extract product info from callback data
+    parts = query.data.replace("product:", "").split(":", 1)
+    product_id = int(parts[0])
+    product_name = parts[1]
     
-    # Get product info
-    products = read_products()
-    product = next((p for p in products if p["product_name"] == product_name), None)
+    context.user_data["current_product"] = product_id
+    context.user_data["current_product_name"] = product_name
     
-    if not product:
-        return await show_product_selection(query, context)
-    
-    current_qty = context.user_data.get("items", {}).get(product_name, 0)
+    current_qty = context.user_data.get("items", {}).get(product_id, 0)
     
     # Create quick quantity buttons
     keyboard = [
@@ -705,9 +983,7 @@ async def product_selected(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
-    message_text = (
-        f"📦 **{product['product_name']}**\n\n"
-    )
+    message_text = f"📦 **{product_name}**\n\n"
     
     if current_qty > 0:
         message_text += f"Current quantity: {current_qty}\n\n"
@@ -729,18 +1005,18 @@ async def quantity_button_pressed(update: Update, context: ContextTypes.DEFAULT_
     await query.answer()
     
     qty = int(query.data.replace("qty:", ""))
-    product_name = context.user_data.get("current_product")
+    product_id = context.user_data.get("current_product")
     
-    if not product_name:
+    if not product_id:
         return await show_product_selection(query, context)
     
     if "items" not in context.user_data:
         context.user_data["items"] = {}
     
     if qty > 0:
-        context.user_data["items"][product_name] = qty
-    elif product_name in context.user_data["items"]:
-        del context.user_data["items"][product_name]
+        context.user_data["items"][product_id] = qty
+    elif product_id in context.user_data["items"]:
+        del context.user_data["items"][product_id]
     
     # Return to product selection
     return await show_product_selection(query, context)
@@ -761,9 +1037,10 @@ async def quantity_typed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await update.message.reply_text("❌ Please enter a valid number.")
         return ENTER_QUANTITY
     
-    product_name = context.user_data.get("current_product")
+    product_id = context.user_data.get("current_product")
+    product_name = context.user_data.get("current_product_name", "Product")
     
-    if not product_name:
+    if not product_id:
         await update.message.reply_text("❌ No product selected. Please start over with /order")
         return ConversationHandler.END
     
@@ -771,17 +1048,16 @@ async def quantity_typed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data["items"] = {}
     
     if qty > 0:
-        context.user_data["items"][product_name] = qty
-    elif product_name in context.user_data["items"]:
-        del context.user_data["items"][product_name]
+        context.user_data["items"][product_id] = qty
+    elif product_id in context.user_data["items"]:
+        del context.user_data["items"][product_id]
     
     if qty > 0:
         await update.message.reply_text(f"✅ Added: {product_name} × {qty}")
     else:
         await update.message.reply_text(f"🗑️ Removed: {product_name}")
     
-    # Show product selection again
-    # We need to send a new message with the keyboard
+    # Show product selection again as new message
     return await show_product_selection_new_message(update, context)
 
 
@@ -791,7 +1067,7 @@ async def show_product_selection_new_message(update: Update, context: ContextTyp
     
     if not products:
         await update.message.reply_text(
-            "❌ No products found. Please check the products.csv file."
+            "❌ No products found. Please contact admin."
         )
         return ConversationHandler.END
     
@@ -803,23 +1079,25 @@ async def show_product_selection_new_message(update: Update, context: ContextTyp
     order_summary = ""
     if items:
         order_summary = "\n\n📦 **Current Order:**\n"
-        for product_name, qty in items.items():
-            if qty > 0:
-                order_summary += f"• {product_name}: {qty}\n"
+        for product in products:
+            pid = product['product_id']
+            if pid in items and items[pid] > 0:
+                order_summary += f"• {product['product_name']}: {items[pid]}\n"
     
     # Create inline keyboard with products
     keyboard = []
     for product in products:
-        name = product["product_name"]
-        qty = items.get(name, 0)
+        pid = product['product_id']
+        qty = items.get(pid, 0)
+        price = float(product['price'])
         
         if qty > 0:
-            display_text = f"✅ {name} ({qty})"
+            display_text = f"✅ {product['product_name']} (৳{price:.0f}) [{qty}]"
         else:
-            display_text = f"➕ {name}"
+            display_text = f"➕ {product['product_name']} (৳{price:.0f})"
         
         keyboard.append([
-            InlineKeyboardButton(display_text, callback_data=f"product:{name}")
+            InlineKeyboardButton(display_text, callback_data=f"product:{pid}:{product['product_name']}")
         ])
     
     # Add action buttons
@@ -831,7 +1109,7 @@ async def show_product_selection_new_message(update: Update, context: ContextTyp
     if action_row:
         keyboard.append(action_row)
     
-    keyboard.append([InlineKeyboardButton("◀️ Back to Shops", callback_data=f"back:shops")])
+    keyboard.append([InlineKeyboardButton("◀️ Back to Shops", callback_data="back:shops")])
     
     reply_markup = InlineKeyboardMarkup(keyboard)
     
@@ -857,16 +1135,17 @@ async def back_to_shops(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     query = update.callback_query
     await query.answer()
     
+    area_id = context.user_data.get("area_id")
     area_name = context.user_data.get("area_name", "")
-    shops = get_shops_by_area(area_name)
+    shops = get_shops_by_area(area_id)
     
     keyboard = []
     for shop in shops:
         display_text = shop["shop_name"]
         if shop["shop_address"]:
-            display_text += f" ({shop['shop_address']})"
+            display_text += f" ({shop['shop_address'][:30]}...)" if len(shop['shop_address']) > 30 else f" ({shop['shop_address']})"
         keyboard.append([
-            InlineKeyboardButton(display_text, callback_data=f"shop:{shop['shop_name']}")
+            InlineKeyboardButton(display_text, callback_data=f"shop:{shop['shop_id']}:{shop['shop_name']}")
         ])
     
     keyboard.append([InlineKeyboardButton("◀️ Back to Areas", callback_data="back:areas")])
@@ -917,10 +1196,20 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     # Build order summary
     order_summary = ""
     total_items = 0
-    for product_name, qty in items.items():
-        if qty > 0:
-            order_summary += f"  • {product_name} x {qty}\n"
+    total_price = 0
+    
+    for product in products:
+        pid = product['product_id']
+        if pid in items and items[pid] > 0:
+            qty = items[pid]
+            price = float(product['price'])
+            discount = float(product['discount'])
+            final_price = price * (1 - discount/100)
+            line_total = final_price * qty
+            
+            order_summary += f"  • {product['product_name']} x {qty} = ৳{line_total:.0f}\n"
             total_items += qty
+            total_price += line_total
     
     message_text = (
         "📋 ORDER SUMMARY\n"
@@ -928,7 +1217,8 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         f"📍 Area: {area_name}\n"
         f"🏪 Shop: {shop_name}\n\n"
         f"📦 Items:\n{order_summary}\n"
-        f"📊 Total items: {total_items}\n\n"
+        f"📊 Total items: {total_items}\n"
+        f"💰 Total: ৳{total_price:.0f}\n\n"
         "Please confirm your order:"
     )
     
@@ -951,42 +1241,48 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 
 async def submit_order(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Submit the order and save to CSV."""
+    """Submit the order and save to database."""
     query = update.callback_query
     await query.answer("Submitting order...")
     
-    # Get user info
-    user = query.from_user
+    db_user = context.user_data.get("db_user")
     
-    # Prepare order data
+    # Prepare order data with verified photo
     order_data = {
-        "user_id": user.id,
-        "username": user.username or user.first_name or str(user.id),
-        "area_name": context.user_data.get("area_name", ""),
-        "shop_name": context.user_data.get("shop_name", ""),
+        "user_id": db_user['user_id'],
+        "shop_id": context.user_data.get("shop_id"),
         "items": context.user_data.get("items", {}),
+        "image_url": context.user_data.get("verified_photo_path"),  # Include verified photo
     }
     
     # Save order
     try:
-        filename, order_id = save_order(order_data)
+        _, order_id = save_order(order_data)
         
         # Build order summary
+        products = read_products()
         items = order_data["items"]
         order_summary = ""
         total_qty = 0
-        for product_name, qty in items.items():
-            if qty > 0:
-                order_summary += f"  • {product_name} x {qty}\n"
+        
+        for product in products:
+            pid = product['product_id']
+            if pid in items and items[pid] > 0:
+                qty = items[pid]
+                order_summary += f"  • {product['product_name']} x {qty}\n"
                 total_qty += qty
+        
+        # Include photo verification status in message
+        photo_status = "✅ Verified" if order_data["image_url"] else "❌ Not provided"
         
         message_text = (
             "✅ ORDER SUBMITTED SUCCESSFULLY!\n"
             "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"🆔 Order ID:\n   {order_id}\n\n"
-            f"👤 User: {order_data['username']}\n\n"
-            f"📍 Area: {order_data['area_name']}\n"
-            f"🏪 Shop: {order_data['shop_name']}\n\n"
+            f"🆔 Order ID: {order_id}\n\n"
+            f"👤 User: {db_user['name']}\n\n"
+            f"📍 Area: {context.user_data.get('area_name', '')}\n"
+            f"🏪 Shop: {context.user_data.get('shop_name', '')}\n"
+            f"📸 Photo: {photo_status}\n\n"
             f"📦 Ordered Items:\n{order_summary}\n"
             f"📊 Total Quantity: {total_qty}\n\n"
             f"📌 Status: PENDING\n\n"
@@ -1075,17 +1371,13 @@ def main() -> None:
         print("Get your token from @BotFather on Telegram.")
         return
     
-    # Ensure required directories exist
-    ORDERS_DIR.mkdir(parents=True, exist_ok=True)
-    
-    # Check if data files exist
-    if not SHOPS_FILE.exists():
-        logger.warning(f"Shops file not found: {SHOPS_FILE}")
-        print(f"\n⚠️ Warning: {SHOPS_FILE} not found")
-    
-    if not PRODUCTS_FILE.exists():
-        logger.warning(f"Products file not found: {PRODUCTS_FILE}")
-        print(f"\n⚠️ Warning: {PRODUCTS_FILE} not found")
+    # Test database connection
+    connection = get_db_connection()
+    if not connection:
+        print("\n❌ Error: Cannot connect to database")
+        print("Please check your MySQL connection settings.")
+        return
+    connection.close()
     
     # Create the Application
     application = Application.builder().token(token).build()
@@ -1099,6 +1391,11 @@ def main() -> None:
             ],
             SELECT_SHOP: [
                 CallbackQueryHandler(shop_selected, pattern=r"^shop:"),
+                CallbackQueryHandler(handle_back, pattern=r"^back:"),
+            ],
+            VERIFY_PHOTO: [
+                MessageHandler(filters.Document.IMAGE, handle_photo_document),
+                MessageHandler(filters.PHOTO, handle_compressed_photo),
                 CallbackQueryHandler(handle_back, pattern=r"^back:"),
             ],
             SELECT_PRODUCTS: [
@@ -1130,9 +1427,8 @@ def main() -> None:
     # Start the bot
     print("\n🤖 OrderKato Bot is starting...")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    print(f"📁 Shops file: {SHOPS_FILE}")
-    print(f"📁 Products file: {PRODUCTS_FILE}")
-    print(f"📁 Orders directory: {ORDERS_DIR}")
+    print(f"📁 Token file: {TOKEN_FILE}")
+    print(f"🗄️  Database: {DB_CONFIG['database']}@{DB_CONFIG['host']}")
     print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
     print("Press Ctrl+C to stop the bot.\n")
     

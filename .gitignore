@@ -1,6 +1,12 @@
 # Bot token (sensitive)
 config/token.txt
 
+# Shop verification images (can be large)
+ShopImage/
+
+# Temporary files
+temp/
+
 # Python
 __pycache__/
 *.py[cod]

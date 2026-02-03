@@ -1,6 +1,6 @@
 # OrderKato Telegram Bot
 
-A simple Telegram bot for field order management. Designed for operational use with easy-to-edit CSV data files.
+A Telegram bot for field order management with MySQL database backend and photo verification.
 
 ## 📁 Directory Structure
 
@@ -9,32 +9,56 @@ OrderKatoBot/
 ├── orderkato_bot.py        # Main bot script
 ├── .gitignore              # Git ignore file
 ├── config/
-│   ├── token.txt           # Telegram bot token (edit this!)
-│   └── order.txt           # Order counter (auto-managed)
-├── data/
-│   ├── shops.csv           # Shop and area data
-│   ├── products.csv        # Product data
-│   └── orders/             # Auto-generated daily order files
-│       └── orders_YYYY-MM-DD.csv
+│   └── token.txt           # Telegram bot token (edit this!)
+├── ShopImage/              # Verified shop photos (auto-created)
+├── temp/                   # Temporary files (auto-created)
 └── README.md
 ```
+
+## 🗄️ Database
+
+This bot uses **MySQL** database (`Orderkatodb`) with the following tables:
+
+| Table | Description |
+|-------|-------------|
+| `area` | Areas/regions for shop grouping |
+| `shops` | Shop information linked to areas |
+| `product` | Product catalog |
+| `brand` | Product brands |
+| `users` | Registered bot users (with telegram username) |
+| `orders` | Order records with image_url |
+| `order_product` | Order items (product quantities) |
 
 ## 🚀 Setup
 
 ### 1. Install Python Dependencies
 
 ```bash
-pip install python-telegram-bot
+pip install python-telegram-bot mysql-connector-python Pillow
 ```
 
-### 2. Get Your Telegram Bot Token
+### 2. Configure MySQL Database
+
+Ensure your MySQL database `Orderkatodb` is running with the required tables. Update the connection settings in `orderkato_bot.py` if needed:
+
+```python
+DB_CONFIG = {
+    "host": "127.0.0.1",
+    "port": 3306,
+    "database": "Orderkatodb",
+    "user": "your_username",
+    "password": "your_password",
+}
+```
+
+### 3. Get Your Telegram Bot Token
 
 1. Open Telegram and search for `@BotFather`
 2. Send `/newbot` command
 3. Follow the instructions to create your bot
 4. Copy the API token provided
 
-### 3. Configure the Token
+### 4. Configure the Token
 
 Edit `config/token.txt` and replace the placeholder with your actual bot token:
 
@@ -42,7 +66,7 @@ Edit `config/token.txt` and replace the placeholder with your actual bot token:
 YOUR_ACTUAL_BOT_TOKEN_HERE
 ```
 
-### 4. Run the Bot
+### 5. Run the Bot
 
 ```bash
 python orderkato_bot.py
@@ -57,6 +81,7 @@ python orderkato_bot.py
 | `/start` | Welcome message |
 | `/order` | Start a new order |
 | `/status` | Check your order status |
+| `/update` | Update order status (mark delivered/cancel) |
 | `/cancel` | Cancel current order |
 | `/help` | Show help message |
 
@@ -65,113 +90,106 @@ python orderkato_bot.py
 1. Type `/order` to start
 2. Select an **area** from the list
 3. Select a **shop** from that area
-4. Tap products to add them to your order
-5. Enter quantities (tap quick buttons or type a number)
-6. Review and confirm your order
+4. 📸 **Photo Verification** - Send a recent photo of the shop as a document
+5. Tap products to add them to your order
+6. Enter quantities (tap quick buttons or type a number)
+7. Review and confirm your order
+
+### 📸 Photo Verification
+
+After selecting a shop, you must send a verification photo:
+
+- **Format**: Send as **document/file** (not compressed photo)
+- **Freshness**: Photo must be taken **within the last 1 minute**
+- **EXIF Required**: Photo must contain timestamp metadata
+
+**How to send as file:**
+1. Tap the 📎 attach icon
+2. Select **File** (not Photo)
+3. Choose your photo from gallery
+
+This ensures the user is physically at the shop location when placing the order.
 
 ### Check Order Status
 
 Type `/status` to see all your orders with their current status:
 - 🟡 PENDING - Order placed, awaiting delivery
 - ✅ DELIVERED - Order has been delivered
-- ❌ CANCELLED - Order was cancelled
+- ⚠️ UNDER-DELIVERED / OVER-DELIVERED - Partial delivery issues
 
-## 📝 Data Files
+### Update Order Status
 
-### shops.csv
+Type `/update` to see pending orders and quickly:
+- Mark as **Delivered** ✅
+- **Cancel** the order ❌
 
-Contains shop information organized by area. Edit this file to add/remove shops.
+## 🗃️ Database Schema
 
-```csv
-area_name,shop_name,shop_address
-Bonani,City Mart,123 Main Street
-Bonani,Quick Stop,456 Central Ave
-Mirpur,Fresh Market,101 North Blvd
-Badda,Value Shop,404 Pine Road
+### Users Table
+Users must be registered in the database with their Telegram username to use the bot.
+
+```sql
+CREATE TABLE users (
+    user_id INT PRIMARY KEY AUTO_INCREMENT,
+    name VARCHAR(100),
+    tel_username VARCHAR(100) UNIQUE,
+    -- other fields...
+);
 ```
 
-**Columns:**
-- `area_name` - Area/region name (used for grouping)
-- `shop_name` - Shop name
-- `shop_address` - Shop address (optional, for display)
-
-### products.csv
-
-Contains the list of available products. **Note:** Only `product_name` column is required.
-
-```csv
-product_name
-Coca-Cola-500ml
-teer-atta
-jibon-water-1L
-teer-oil-1L
+### Orders Table
+```sql
+CREATE TABLE orders (
+    order_id INT PRIMARY KEY AUTO_INCREMENT,
+    user_id INT,
+    shop_id INT,
+    order_timestamp DATETIME,
+    image_url VARCHAR(500),  -- Verified photo path
+    order_status ENUM('Pending', 'Delivered', 'Under-delivered', 'Over-delivered'),
+    FOREIGN KEY (user_id) REFERENCES users(user_id),
+    FOREIGN KEY (shop_id) REFERENCES shops(shop_id)
+);
 ```
 
-**Columns:**
-- `product_name` - Product display name
+## 📷 Shop Images
 
-### orders/orders_YYYY-MM-DD.csv
-
-Auto-generated daily order files. A new file is created automatically for each day.
-
-```csv
-order_id,order_date,order_time,username,area_name,shop_name,product_name,quantity,status
-O1,2026-01-25,10:30:45,john_doe,Bonani,City Mart,Coca-Cola-500ml,10,pending
-O2,2026-01-25,11:15:30,jane_doe,Mirpur,Fresh Market,teer-atta,5,delivered
+Verified photos are stored in the `ShopImage/` folder with the naming format:
+```
+shop_{shop_id}_user_{user_id}_{timestamp}_{uuid}.jpg
 ```
 
-**Columns:**
-- `order_id` - Unique order ID (O1, O2, O3, etc.)
-- `order_date` - Date of order (YYYY-MM-DD)
-- `order_time` - Time of order (HH:MM:SS)
-- `username` - Telegram username
-- `area_name` - Selected area
-- `shop_name` - Selected shop
-- `product_name` - Product name
-- `quantity` - Ordered quantity
-- `status` - Order status (pending/delivered/cancelled)
+The image path is saved in the `image_url` column of the orders table.
 
-Each product is stored as a separate row. Orders with multiple products share the same `order_id`.
+## 🔧 Configuration
 
-### config/order.txt
+### Photo Verification Timeout
 
-Stores the current order counter. This file is auto-managed by the bot - do not edit manually unless you want to reset the order numbering.
+Edit `PHOTO_MAX_AGE_SECONDS` in `orderkato_bot.py` to change the maximum allowed photo age:
 
-## ⚙️ Customization
-
-### Adding New Areas/Shops
-
-Simply edit `data/shops.csv`:
-
-```csv
-area_name,shop_name,shop_address
-New Area,New Shop,123 New Street
+```python
+PHOTO_MAX_AGE_SECONDS = 60  # 1 minute (default)
 ```
-
-No code changes required!
-
-### Adding New Products
-
-Edit `data/products.csv`:
-
-```csv
-product_name
-New Product Name
-```
-
-Changes are applied immediately - no restart needed.
-
-### Updating Order Status
-
-To mark an order as delivered, edit the `data/orders/orders_YYYY-MM-DD.csv` file and change the `status` column from `pending` to `delivered`.
 
 ## 🔧 Troubleshooting
 
 ### "Token file not found"
 Make sure `config/token.txt` exists and contains your bot token.
 
-### "No areas/products found"
-Check that `data/shops.csv` and `data/products.csv` exist and have valid data.
+### "Cannot connect to database"
+- Check MySQL is running
+- Verify database credentials in `DB_CONFIG`
+- Ensure `Orderkatodb` database exists
+
+### "User not registered"
+The Telegram username must be added to the `users` table in the database.
+
+### "No EXIF data found"
+- Take a new photo with your camera app (not screenshot)
+- Make sure camera settings save EXIF metadata
+- Send as document, not compressed photo
+
+### "Photo is too old"
+Take a fresh photo right now and send it immediately.
 
 ### Bot not responding
 - Check your internet connection
@@ -182,3 +200,6 @@ Check that `data/shops.csv` and `data/products.csv` exist and have valid data.
 
 This project is provided as-is for operational use.
 
+---
+
+![OrderKato Bot](screenshot.png)
